@@ -1,12 +1,11 @@
 /**
  * src/opensea.js
- * Parses OpenSea URLs and resolves collection/contract metadata
- * using the OpenSea API v2.
+ * Parses OpenSea URLs, resolves collection/contract metadata,
+ * and AUTO-DETECTS mint schedule from OpenSea API v2.
  */
 
 const { log } = require("./utils");
 
-// Supported networks and their RPC env vars
 const CHAIN_RPC_MAP = {
   ethereum:  process.env.RPC_URL_ETHEREUM  || process.env.RPC_URL,
   polygon:   process.env.RPC_URL_POLYGON   || "https://polygon-rpc.com",
@@ -14,101 +13,129 @@ const CHAIN_RPC_MAP = {
   arbitrum:  process.env.RPC_URL_ARBITRUM  || "https://arb1.arbitrum.io/rpc",
   optimism:  process.env.RPC_URL_OPTIMISM  || "https://mainnet.optimism.io",
   avalanche: process.env.RPC_URL_AVALANCHE || "https://api.avax.network/ext/bc/C/rpc",
-  solana:    null, // not EVM — unsupported
+  solana:    null,
   klaytn:    null,
 };
 
-/**
- * Parses an OpenSea URL and extracts the collection slug or contract info.
- *
- * Supported URL formats:
- *  - https://opensea.io/collection/{slug}
- *  - https://opensea.io/assets/{chain}/{contractAddress}/{tokenId}
- *  - https://opensea.io/assets/ethereum/{contractAddress}/{tokenId}
- */
+// ─── URL PARSER ───────────────────────────────────────────────────────────────
+
 function parseOpenSeaUrl(url) {
   try {
     const parsed = new URL(url);
-    const parts = parsed.pathname.split("/").filter(Boolean);
-
-    // Format: /collection/{slug}
+    const parts  = parsed.pathname.split("/").filter(Boolean);
     if (parts[0] === "collection" && parts[1]) {
       return { type: "slug", slug: parts[1] };
     }
-
-    // Format: /assets/{chain}/{contractAddress}/{tokenId}
     if (parts[0] === "assets" && parts.length >= 3) {
-      const chain = parts[1];
-      const contractAddress = parts[2];
-      return { type: "asset", chain, contractAddress };
+      return { type: "asset", chain: parts[1], contractAddress: parts[2] };
     }
-
     return null;
   } catch {
     return null;
   }
 }
 
-/**
- * Fetches collection metadata from the OpenSea API v2.
- * Requires OPENSEA_API_KEY in .env (free tier available at opensea.io/developers).
- */
+// ─── OPENSEA API HELPERS ──────────────────────────────────────────────────────
+
+function getHeaders() {
+  const headers = { accept: "application/json" };
+  if (process.env.OPENSEA_API_KEY) headers["x-api-key"] = process.env.OPENSEA_API_KEY;
+  return headers;
+}
+
+async function osGet(path) {
+  const res = await fetch(`https://api.opensea.io/api/v2${path}`, { headers: getHeaders() });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`OpenSea API ${res.status} on ${path}: ${body}`);
+  }
+  return res.json();
+}
+
+// ─── MINT SCHEDULE AUTO-DETECTION ────────────────────────────────────────────
+
+async function fetchMintSchedule(slug) {
+
+  // Method 1: /drops endpoint
+  try {
+    const data  = await osGet(`/collections/${slug}/drops`);
+    const drops = data.drops || data.results || [];
+    for (const drop of drops) {
+      const stages = drop.stages || drop.mint_stages || [];
+      for (const stage of stages) {
+        const startIso =
+          stage.start_time || stage.startTime || stage.starts_at ||
+          stage.start_date || drop.start_date || drop.starts_at || null;
+        if (startIso) {
+          const t = new Date(startIso);
+          if (!isNaN(t.getTime())) {
+            log(`📅 Schedule detected via /drops: ${t.toUTCString()}`);
+            log(`   Stage: ${stage.stage || stage.name || "Public"}`);
+            return { startTime: t, stage: stage.stage || stage.name || "Public", source: "drops" };
+          }
+        }
+      }
+      const dropStart = drop.start_date || drop.starts_at || drop.start_time;
+      if (dropStart) {
+        const t = new Date(dropStart);
+        if (!isNaN(t.getTime())) {
+          log(`📅 Schedule detected via /drops: ${t.toUTCString()}`);
+          return { startTime: t, stage: "Public", source: "drops" };
+        }
+      }
+    }
+  } catch (_) {}
+
+  // Method 2: Collection detail fields
+  try {
+    const data = await osGet(`/collections/${slug}`);
+    const candidates = [
+      data.drop_date, data.launch_date, data.mint_date, data?.stats?.drop_date
+    ].filter(Boolean);
+    for (const c of candidates) {
+      const t = new Date(c);
+      if (!isNaN(t.getTime()) && t.getTime() > Date.now() - 86_400_000) {
+        log(`📅 Schedule detected via collection detail: ${t.toUTCString()}`);
+        return { startTime: t, stage: "Public", source: "collection" };
+      }
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+// ─── COLLECTION RESOLVER ──────────────────────────────────────────────────────
+
 async function fetchCollectionBySlug(slug) {
-  const apiKey = process.env.OPENSEA_API_KEY;
-  const headers = { "accept": "application/json" };
-  if (apiKey) headers["x-api-key"] = apiKey;
+  const data      = await osGet(`/collections/${slug}`);
+  const contracts = data.contracts || [];
+  if (!contracts.length) throw new Error("No contracts found for this collection.");
 
-  // 1. Get collection info
-  const collectionRes = await fetch(
-    `https://api.opensea.io/api/v2/collections/${slug}`,
-    { headers }
-  );
-
-  if (!collectionRes.ok) {
-    const err = await collectionRes.text();
-    throw new Error(`OpenSea API error (${collectionRes.status}): ${err}`);
-  }
-
-  const collectionData = await collectionRes.json();
-
-  // 2. Get contract address from the collection's contracts list
-  const contracts = collectionData.contracts || [];
-  if (!contracts.length) {
-    throw new Error("No contracts found for this collection.");
-  }
-
-  // Prefer Ethereum; otherwise take first supported EVM chain
   const preferred = contracts.find((c) => c.chain === "ethereum") || contracts[0];
-  const chain = preferred.chain;
-
+  const chain     = preferred.chain;
   if (!CHAIN_RPC_MAP[chain]) {
-    throw new Error(
-      `Chain "${chain}" is not supported (Solana/Klaytn are non-EVM). ` +
-      `Supported chains: ${Object.keys(CHAIN_RPC_MAP).filter((k) => CHAIN_RPC_MAP[k]).join(", ")}`
-    );
+    throw new Error(`Chain "${chain}" is not a supported EVM chain.`);
   }
+
+  log(`🔍 Auto-detecting mint schedule...`);
+  const schedule = await fetchMintSchedule(slug);
 
   return {
-    name: collectionData.name || slug,
+    name:           data.name || slug,
     slug,
     contractAddress: preferred.address,
     chain,
-    rpcUrl: CHAIN_RPC_MAP[chain],
-    openseaUrl: `https://opensea.io/collection/${slug}`,
+    rpcUrl:          CHAIN_RPC_MAP[chain],
+    openseaUrl:      `https://opensea.io/collection/${slug}`,
+    mintStartTime:   schedule?.startTime || null,
+    mintStage:       schedule?.stage     || null,
+    scheduleSource:  schedule?.source    || null,
   };
 }
 
-/**
- * Resolves a full OpenSea URL into a collection object:
- * { name, slug, contractAddress, chain, rpcUrl, openseaUrl }
- */
 async function resolveCollectionFromUrl(url) {
   const parsed = parseOpenSeaUrl(url);
-  if (!parsed) {
-    throw new Error("Could not parse OpenSea URL. Supported formats:\n" +
-      "  https://opensea.io/collection/{slug}\n" +
-      "  https://opensea.io/assets/{chain}/{contractAddress}/{tokenId}");
-  }
+  if (!parsed) throw new Error("Could not parse OpenSea URL.");
 
   if (parsed.type === "slug") {
     log(`Fetching collection data for slug: ${parsed.slug}`);
@@ -116,21 +143,14 @@ async function resolveCollectionFromUrl(url) {
   }
 
   if (parsed.type === "asset") {
-    const chain = parsed.chain;
-    if (!CHAIN_RPC_MAP[chain]) {
-      throw new Error(`Chain "${chain}" is not a supported EVM chain.`);
-    }
-    log(`Resolved contract directly from URL.`);
+    const { chain, contractAddress } = parsed;
+    if (!CHAIN_RPC_MAP[chain]) throw new Error(`Chain "${chain}" not supported.`);
     return {
-      name: parsed.contractAddress,
-      slug: null,
-      contractAddress: parsed.contractAddress,
-      chain,
-      rpcUrl: CHAIN_RPC_MAP[chain],
-      openseaUrl: url,
+      name: contractAddress, slug: null, contractAddress, chain,
+      rpcUrl: CHAIN_RPC_MAP[chain], openseaUrl: url,
+      mintStartTime: null, mintStage: null, scheduleSource: null,
     };
   }
-
   return null;
 }
 

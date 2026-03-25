@@ -1,6 +1,7 @@
 /**
  * src/minter.js
- * Core bot logic: time detection, eligibility checking, gas gating, and minting.
+ * Core bot: auto-detects mint time, waits with countdown,
+ * checks eligibility, gates on gas, then mints.
  */
 
 const { ethers } = require("ethers");
@@ -14,8 +15,9 @@ const CONFIG = {
   retryDelayMs:    parseInt(process.env.RETRY_DELAY    || "30000"),
   maxRetries:      parseInt(process.env.MAX_RETRIES    || "5"),
   mintOnce:        process.env.MINT_ONCE !== "false",
+  minBalanceEth:   process.env.MIN_BALANCE_ETH         || "0.0005",
+  // Manual override — only used if OpenSea API returns nothing
   mintStartTime:   process.env.MINT_START_TIME         || null,
-  minBalanceEth:   process.env.MIN_BALANCE_ETH         || "0.002",
 };
 
 const ABI = [
@@ -33,10 +35,12 @@ const ABI = [
   "function mintPrice() view returns (uint256)",
   "function cost() view returns (uint256)",
   "function getPrice() view returns (uint256)",
+  // Contract-level time functions (fallback)
   "function mintStartTime() view returns (uint256)",
   "function startTime() view returns (uint256)",
   "function publicSaleStartTime() view returns (uint256)",
   "function saleStartTime() view returns (uint256)",
+  // Mint functions
   "function mint(uint256 quantity) payable",
   "function mint(address to, uint256 quantity) payable",
   "function publicMint(uint256 quantity) payable",
@@ -64,93 +68,114 @@ async function getMintPrice(contract) {
 
 async function getMaxSupply(contract) {
   return (await tryRead(contract, "maxSupply")) ??
-         (await tryRead(contract, "MAX_SUPPLY")) ??
-         null;
+         (await tryRead(contract, "MAX_SUPPLY")) ?? null;
 }
 
 function formatCountdown(ms) {
-  if (ms <= 0) return "now";
-  const totalSecs = Math.floor(ms / 1000);
-  const h = Math.floor(totalSecs / 3600);
-  const m = Math.floor((totalSecs % 3600) / 60);
-  const s = totalSecs % 60;
-  return `${h}h ${m}m ${s}s`;
+  if (ms <= 0) return "NOW";
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0)  return `${h}h ${m}m ${sec}s`;
+  if (m > 0)  return `${m}m ${sec}s`;
+  return `${sec}s`;
 }
 
-// ─── TIME CHECK ───────────────────────────────────────────────────────────────
+// ─── MINT TIME RESOLUTION ─────────────────────────────────────────────────────
+// Priority: 1) OpenSea API (passed in from opensea.js)
+//           2) Manual .env override
+//           3) Contract on-chain time functions
+//           4) No time → mint immediately when eligible
 
-async function getMintStartTime(contract) {
-  // 1. Check .env override first
+async function resolveMintTime(collection, contract) {
+
+  // 1. OpenSea API — already fetched in opensea.js
+  if (collection.mintStartTime) {
+    const t = new Date(collection.mintStartTime);
+    log(`⏰ Mint time (from OpenSea API): ${t.toUTCString()}`);
+    if (collection.mintStage) log(`   Stage: ${collection.mintStage}`);
+    return t;
+  }
+
+  // 2. Manual .env override
   if (CONFIG.mintStartTime) {
     const t = new Date(CONFIG.mintStartTime);
     if (!isNaN(t.getTime())) {
-      log(`⏰ Mint time from .env: ${t.toUTCString()}`);
+      log(`⏰ Mint time (from .env override): ${t.toUTCString()}`);
       return t;
     }
   }
 
-  // 2. Try to read mint start time directly from contract
+  // 3. Read time directly from contract
   for (const fn of ["mintStartTime", "startTime", "publicSaleStartTime", "saleStartTime"]) {
     const ts = await tryRead(contract, fn);
     if (ts !== null && ts > 0n) {
       const t = new Date(Number(ts) * 1000);
-      log(`⏰ Mint time from contract (${fn}): ${t.toUTCString()}`);
+      log(`⏰ Mint time (from contract ${fn}()): ${t.toUTCString()}`);
       return t;
     }
   }
 
-  // 3. No time found — mint immediately when eligible
-  log(`⏰ No scheduled mint time found — will mint as soon as eligible.`);
+  // 4. No scheduled time found
+  log(`⏰ No scheduled mint time detected — will mint as soon as eligible.`);
   return null;
 }
 
-async function waitForMintTime(mintTime) {
-  if (!mintTime) return; // No scheduled time, proceed immediately
+// ─── COUNTDOWN ────────────────────────────────────────────────────────────────
 
-  const now = Date.now();
+async function waitForMintTime(mintTime) {
+  if (!mintTime) return;
+
+  const now    = Date.now();
   const target = mintTime.getTime();
 
   if (now >= target) {
-    log(`✅ Mint time already reached.`);
+    log(`✅ Mint time already passed — proceeding immediately.`);
     return;
   }
 
   const diff = target - now;
-  log(`⏳ Mint opens in ${formatCountdown(diff)} — waiting until ${mintTime.toUTCString()}`);
+  log(`\n⏳ Bot is armed. Mint opens in ${formatCountdown(diff)}`);
+  log(`   Target: ${mintTime.toUTCString()}`);
+  log(`   Bot will fire automatically — you can leave this running.\n`);
 
-  // Print live countdown every 10 seconds while waiting
   while (Date.now() < target) {
     const remaining = target - Date.now();
-    if (remaining > 60_000) {
-      // More than 1 min away — update every 10s
-      process.stdout.write(`\r⏳ Time until mint: ${formatCountdown(remaining)}   `);
+
+    if (remaining > 3_600_000) {
+      // > 1 hour: update every 60s
+      process.stdout.write(`\r⏳  ${formatCountdown(remaining)} until mint...   `);
+      await sleep(60_000);
+    } else if (remaining > 60_000) {
+      // 1 hour → 1 min: update every 10s
+      process.stdout.write(`\r⏳  ${formatCountdown(remaining)} until mint...   `);
       await sleep(10_000);
     } else if (remaining > 5_000) {
-      // Under 1 minute — update every second
-      process.stdout.write(`\r🔥 MINTING IN: ${formatCountdown(remaining)}   `);
+      // Under 1 min: update every second
+      process.stdout.write(`\r🔥  MINTING IN ${formatCountdown(remaining)}...   `);
       await sleep(1_000);
     } else {
       // Final 5 seconds
-      process.stdout.write(`\r🚨 MINTING IN: ${Math.ceil(remaining / 1000)}s   `);
+      process.stdout.write(`\r🚨  FIRING IN ${Math.ceil(remaining / 1000)}s...   `);
       await sleep(500);
     }
   }
 
   process.stdout.write("\n");
-  log(`🟢 Mint time reached! Attempting to mint...`);
+  log(`🟢 Mint time reached! Executing...`);
 }
 
 // ─── BALANCE CHECK ────────────────────────────────────────────────────────────
 
-async function checkBalance(provider, walletAddress) {
-  const balance = await provider.getBalance(walletAddress);
+async function checkBalance(provider, address) {
+  const balance    = await provider.getBalance(address);
   const minBalance = ethers.parseEther(CONFIG.minBalanceEth);
-
   if (balance < minBalance) {
-    log(`💸 Insufficient balance!`, "ERROR");
-    log(`   Have:  ${ethers.formatEther(balance)} ETH`, "ERROR");
-    log(`   Need:  ~${CONFIG.minBalanceEth} ETH for gas`, "ERROR");
-    log(`   Top up your wallet and restart the bot.`, "ERROR");
+    log(`\n💸 Wallet balance too low!`, "ERROR");
+    log(`   Have: ${ethers.formatEther(balance)} ETH`, "ERROR");
+    log(`   Need: ~${CONFIG.minBalanceEth} ETH for gas`, "ERROR");
+    log(`   Top up and restart the bot.`, "ERROR");
     return false;
   }
   return true;
@@ -164,10 +189,7 @@ async function checkEligibility(contract, walletAddress) {
 
   for (const fn of ["mintingEnabled", "publicMintEnabled", "isPublicMintEnabled"]) {
     const enabled = await tryRead(contract, fn);
-    if (enabled === false) {
-      log(`❌ ${fn}() = false — mint not open yet.`);
-      return false;
-    }
+    if (enabled === false) { log(`❌ ${fn}() = false — not open yet.`); return false; }
   }
 
   const total = await tryRead(contract, "totalSupply");
@@ -181,7 +203,7 @@ async function checkEligibility(contract, walletAddress) {
   if (allowlistActive === true) {
     const whitelisted = await tryRead(contract, "isWhitelisted", walletAddress);
     if (whitelisted === false) { log(`❌ Wallet not on allowlist.`); return false; }
-    log(`   Allowlist: ✅`);
+    log(`   Allowlist: ✅ eligible`);
   }
 
   return true;
@@ -190,15 +212,15 @@ async function checkEligibility(contract, walletAddress) {
 // ─── GAS CHECK ────────────────────────────────────────────────────────────────
 
 async function gasPriceOk(provider) {
-  const feeData = await provider.getFeeData();
-  const current = feeData.gasPrice;
-  const maxGwei = ethers.parseUnits(CONFIG.maxGasGwei, "gwei");
-  const currentGwei = ethers.formatUnits(current, "gwei");
+  const feeData      = await provider.getFeeData();
+  const current      = feeData.gasPrice;
+  const maxGwei      = ethers.parseUnits(CONFIG.maxGasGwei, "gwei");
+  const currentGwei  = parseFloat(ethers.formatUnits(current, "gwei")).toFixed(3);
   if (current > maxGwei) {
-    log(`⛽ Gas too high: ${parseFloat(currentGwei).toFixed(2)} Gwei (max: ${CONFIG.maxGasGwei})`);
+    log(`⛽ Gas too high: ${currentGwei} Gwei (max: ${CONFIG.maxGasGwei})`);
     return false;
   }
-  log(`   Gas: ${parseFloat(currentGwei).toFixed(2)} Gwei ✅`);
+  log(`   Gas: ${currentGwei} Gwei ✅`);
   return true;
 }
 
@@ -228,31 +250,25 @@ async function attemptMint(contract, wallet, provider) {
   for (const attempt of attempts) {
     try {
       log(`🚀 Sending mint transaction...`);
-      const tx = await attempt();
+      const tx      = await attempt();
       log(`   Tx hash: ${tx.hash}`);
       const receipt = await tx.wait();
       log(`✅ Minted! Block #${receipt.blockNumber} | Gas used: ${receipt.gasUsed}`);
       return receipt;
     } catch (err) {
-      // Insufficient funds — stop immediately, no point retrying
       if (err.code === "INSUFFICIENT_FUNDS" || err.message?.includes("insufficient funds")) {
-        log(`💸 Insufficient funds for gas.`, "ERROR");
-        log(`   Top up your wallet with at least ${CONFIG.minBalanceEth} ETH and restart.`, "ERROR");
+        log(`💸 Insufficient funds for gas. Top up and restart.`, "ERROR");
         process.exit(1);
       }
-      // Wrong function signature — try next
       if (
         err.code === "CALL_EXCEPTION" ||
         err.message?.includes("is not a function") ||
         err.message?.includes("no matching function") ||
         err.message?.includes("ambiguous function")
-      ) {
-        continue;
-      }
+      ) continue;
       throw err;
     }
   }
-
   throw new Error("No compatible mint function found on this contract.");
 }
 
@@ -262,38 +278,40 @@ async function startMintBot(collection) {
   const { contractAddress, chain, rpcUrl, name } = collection;
 
   if (!process.env.PRIVATE_KEY) throw new Error("PRIVATE_KEY not set in .env");
-  if (!rpcUrl) throw new Error(`No RPC URL for chain: ${chain}`);
+  if (!rpcUrl) throw new Error(`No RPC URL configured for chain: ${chain}`);
 
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
   const contract = new ethers.Contract(contractAddress, ABI, wallet);
 
   const balance = await provider.getBalance(wallet.address);
+
   console.log("\n─────────────────────────────────────────");
   log(`Wallet:     ${wallet.address}`);
   log(`Balance:    ${ethers.formatEther(balance)} ETH`);
   log(`Collection: ${name}`);
   log(`Contract:   ${contractAddress}`);
   log(`Chain:      ${chain}`);
-  log(`Interval:   every ${CONFIG.checkIntervalMs / 1000}s`);
+  log(`Mint amt:   ${CONFIG.mintAmount}`);
   log(`Max gas:    ${CONFIG.maxGasGwei} Gwei`);
   console.log("─────────────────────────────────────────\n");
 
-  // ── STEP 1: Balance pre-check ──────────────────────────────────────────────
+  // Step 1 — Balance pre-check
   const balanceOk = await checkBalance(provider, wallet.address);
   if (!balanceOk) process.exit(1);
 
-  // ── STEP 2: Detect & wait for mint start time ──────────────────────────────
-  const mintTime = await getMintStartTime(contract);
+  // Step 2 — Resolve mint time (API → .env → contract → none)
+  const mintTime = await resolveMintTime(collection, contract);
+
+  // Step 3 — Wait with live countdown
   await waitForMintTime(mintTime);
 
-  // ── STEP 3: Eligibility + mint loop ───────────────────────────────────────
+  // Step 4 — Eligibility + mint loop
   let failures = 0;
   let minted   = false;
 
   while (!minted || !CONFIG.mintOnce) {
     log(`Checking eligibility...`);
-
     try {
       const eligible = await checkEligibility(contract, wallet.address);
 
@@ -305,10 +323,9 @@ async function startMintBot(collection) {
       }
 
       log(`🟢 ELIGIBLE! Checking gas...`);
-
       const gasOk = await gasPriceOk(provider);
       if (!gasOk) {
-        log(`Waiting ${CONFIG.retryDelayMs / 1000}s for gas to drop...\n`);
+        log(`Waiting ${CONFIG.retryDelayMs / 1000}s for gas to drop...`);
         await sleep(CONFIG.retryDelayMs);
         continue;
       }
