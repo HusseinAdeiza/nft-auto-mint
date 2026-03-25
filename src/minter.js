@@ -139,13 +139,13 @@ async function attemptMint(contract, wallet, provider) {
 
   // Try mint function signatures in priority order
   const attempts = [
-    () => contract.mint(CONFIG.mintAmount, opts),
+    () => contract["mint(uint256)"](CONFIG.mintAmount, opts),
     () => contract.publicMint(CONFIG.mintAmount, opts),
     () => contract.mintPublic(CONFIG.mintAmount, opts),
     () => contract.mintNFT(CONFIG.mintAmount, opts),
     () => contract.allowlistMint(CONFIG.mintAmount, opts),
     () => contract.presaleMint(CONFIG.mintAmount, opts),
-    () => contract.mint(wallet.address, CONFIG.mintAmount, opts),
+    () => contract["mint(address,uint256)"](wallet.address, CONFIG.mintAmount, opts),
     () => contract.safeMint(wallet.address, opts),
   ];
 
