@@ -1,0 +1,23 @@
+{
+  "name": "nft-auto-mint",
+  "version": "1.0.0",
+  "description": "Auto-mint bot that monitors OpenSea collections and mints NFTs when your wallet becomes eligible.",
+  "main": "index.js",
+  "bin": {
+    "nft-mint": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "mint": "node index.js"
+  },
+  "keywords": ["nft", "opensea", "mint", "ethereum", "web3", "ethers"],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.12.0"
+  }
+}
