@@ -22,7 +22,7 @@ const CONFIG = {
 // Explorer API endpoints per chain
 const EXPLORER_API = {
   ethereum:  { url: "https://api.etherscan.io/api",              key: process.env.ETHERSCAN_API_KEY  || "" },
-  arbitrum:  { url: "https://api.arbiscan.io/api",               key: process.env.ARBISCAN_API_KEY   || "" },
+  arbitrum:  { url: "https://api.etherscan.io/v2/api?chainid=42161", key: process.env.ARBISCAN_API_KEY   || "" },
   base:      { url: "https://api.basescan.org/api",              key: process.env.BASESCAN_API_KEY   || "" },
   polygon:   { url: "https://api.polygonscan.com/api",           key: process.env.POLYGONSCAN_API_KEY|| "" },
   optimism:  { url: "https://api-optimistic.etherscan.io/api",   key: process.env.OPTIMISM_API_KEY   || "" },
@@ -77,7 +77,7 @@ async function fetchABIFromExplorer(contractAddress, chain) {
   if (!explorer) return null;
 
   try {
-    const url = `${explorer.url}?module=contract&action=getabi&address=${contractAddress}&apikey=${explorer.key}`;
+    const url = `${explorer.url}&module=contract&action=getabi&address=${contractAddress}&apikey=${explorer.key}`;
     const res  = await fetch(url);
     const data = await res.json();
 
