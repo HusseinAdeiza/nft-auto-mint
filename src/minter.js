@@ -328,6 +328,13 @@ async function attemptMint(contract, wallet, provider, abi) {
       { label: "mintTo(address,uint256)", call: () => contract.mintTo(wallet.address, CONFIG.mintAmount, opts) },
       { label: "freeMint()",           call: () => contract.freeMint(opts) },
       { label: "safeMint(address)",    call: () => contract.safeMint(wallet.address, opts) },
+      { label: "mintTo(address)",        call: () => contract.mintTo(wallet.address, opts) },
+      { label: "collectiveMint()",       call: () => contract.collectiveMint(opts) },
+      { label: "openMint(uint256)",      call: () => contract.openMint(CONFIG.mintAmount, opts) },
+      { label: "drop()",                 call: () => contract.drop(opts) },
+      { label: "claimFree()",            call: () => contract.claimFree(opts) },
+      { label: "airdrop(address)",       call: () => contract.airdrop(wallet.address, opts) },
+      { label: "purchase(uint256)",      call: () => contract.purchase(CONFIG.mintAmount, opts) },
     ];
   } else {
     log(`   Found ${attempts.length} mint function(s): ${attempts.map(a => a.label).join(", ")}`);
