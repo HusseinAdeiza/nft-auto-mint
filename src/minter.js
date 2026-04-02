@@ -1,7 +1,7 @@
 /**
  * src/minter.js
- * Core bot: auto-detects mint time, waits with countdown,
- * checks eligibility, gates on gas, then mints.
+ * Core bot: auto-fetches real contract ABI from block explorer,
+ * finds the correct mint function, waits for mint time, then mints.
  */
 
 const { ethers } = require("ethers");
@@ -15,12 +15,22 @@ const CONFIG = {
   retryDelayMs:    parseInt(process.env.RETRY_DELAY    || "30000"),
   maxRetries:      parseInt(process.env.MAX_RETRIES    || "5"),
   mintOnce:        process.env.MINT_ONCE !== "false",
-  minBalanceEth:   process.env.MIN_BALANCE_ETH         || "0.0005",
-  // Manual override — only used if OpenSea API returns nothing
+  minBalanceEth:   process.env.MIN_BALANCE_ETH         || "0.0001",
   mintStartTime:   process.env.MINT_START_TIME         || null,
 };
 
-const ABI = [
+// Explorer API endpoints per chain
+const EXPLORER_API = {
+  ethereum:  { url: "https://api.etherscan.io/api",              key: process.env.ETHERSCAN_API_KEY  || "" },
+  arbitrum:  { url: "https://api.arbiscan.io/api",               key: process.env.ARBISCAN_API_KEY   || "" },
+  base:      { url: "https://api.basescan.org/api",              key: process.env.BASESCAN_API_KEY   || "" },
+  polygon:   { url: "https://api.polygonscan.com/api",           key: process.env.POLYGONSCAN_API_KEY|| "" },
+  optimism:  { url: "https://api-optimistic.etherscan.io/api",   key: process.env.OPTIMISM_API_KEY   || "" },
+  avalanche: { url: "https://api.snowtrace.io/api",              key: process.env.SNOWTRACE_API_KEY  || "" },
+};
+
+// Fallback ABI — used if explorer fetch fails
+const FALLBACK_ABI = [
   "function totalSupply() view returns (uint256)",
   "function maxSupply() view returns (uint256)",
   "function MAX_SUPPLY() view returns (uint256)",
@@ -35,12 +45,10 @@ const ABI = [
   "function mintPrice() view returns (uint256)",
   "function cost() view returns (uint256)",
   "function getPrice() view returns (uint256)",
-  // Contract-level time functions (fallback)
   "function mintStartTime() view returns (uint256)",
   "function startTime() view returns (uint256)",
   "function publicSaleStartTime() view returns (uint256)",
   "function saleStartTime() view returns (uint256)",
-  // Mint functions
   "function mint(uint256 quantity) payable",
   "function mint(address to, uint256 quantity) payable",
   "function publicMint(uint256 quantity) payable",
@@ -49,8 +57,101 @@ const ABI = [
   "function safeMint(address to) payable",
   "function mintPublic(uint256 quantity) payable",
   "function mintNFT(uint256 quantity) payable",
+  "function mintTo(address to, uint256 quantity) payable",
+  "function claim() payable",
+  "function claim(address to) payable",
+  "function claim(uint256 quantity) payable",
+  "function claimNFT() payable",
+  "function freeMint() payable",
+  "function freeMint(uint256 quantity) payable",
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 ];
+
+// Keywords that identify a mint/claim write function
+const MINT_KEYWORDS = ["mint", "claim", "free", "drop", "collect", "redeem", "issue", "create"];
+
+// ─── ABI FETCHER ──────────────────────────────────────────────────────────────
+
+async function fetchABIFromExplorer(contractAddress, chain) {
+  const explorer = EXPLORER_API[chain];
+  if (!explorer) return null;
+
+  try {
+    const url = `${explorer.url}?module=contract&action=getabi&address=${contractAddress}&apikey=${explorer.key}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+
+    if (data.status !== "1" || !data.result) return null;
+
+    const abi = JSON.parse(data.result);
+    log(`✅ Fetched real ABI from ${chain} explorer (${abi.length} functions)`);
+    return abi;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Finds all write (non-view, non-pure) functions whose name contains
+ * mint/claim/free/drop keywords — these are the candidate mint functions.
+ */
+function findMintFunctions(abi) {
+  if (!Array.isArray(abi)) return [];
+
+  return abi.filter((item) => {
+    if (item.type !== "function") return false;
+    if (item.stateMutability === "view" || item.stateMutability === "pure") return false;
+    const name = (item.name || "").toLowerCase();
+    return MINT_KEYWORDS.some((kw) => name.includes(kw));
+  });
+}
+
+/**
+ * Builds the list of mint call attempts from the real ABI.
+ * Sorts: no-args first (likely free claim), then quantity, then address+quantity.
+ */
+function buildMintAttempts(mintFunctions, contract, wallet, opts) {
+  const attempts = [];
+
+  for (const fn of mintFunctions) {
+    const inputs = fn.inputs || [];
+    const name   = fn.name;
+
+    // No args — e.g. claim(), freeMint()
+    if (inputs.length === 0) {
+      attempts.push({ label: `${name}()`, call: () => contract[name](opts) });
+      continue;
+    }
+
+    // Single uint256 — e.g. mint(quantity)
+    if (inputs.length === 1 && inputs[0].type === "uint256") {
+      attempts.push({ label: `${name}(qty)`, call: () => contract[name](CONFIG.mintAmount, opts) });
+      continue;
+    }
+
+    // Single address — e.g. claim(to), safeMint(to)
+    if (inputs.length === 1 && inputs[0].type === "address") {
+      attempts.push({ label: `${name}(addr)`, call: () => contract[name](wallet.address, opts) });
+      continue;
+    }
+
+    // address + uint256 — e.g. mint(to, qty), mintTo(to, qty)
+    if (inputs.length === 2 &&
+        inputs[0].type === "address" && inputs[1].type === "uint256") {
+      attempts.push({ label: `${name}(addr,qty)`, call: () => contract[name](wallet.address, CONFIG.mintAmount, opts) });
+      continue;
+    }
+
+    // uint256 + address — e.g. mint(qty, to)
+    if (inputs.length === 2 &&
+        inputs[0].type === "uint256" && inputs[1].type === "address") {
+      attempts.push({ label: `${name}(qty,addr)`, call: () => contract[name](CONFIG.mintAmount, wallet.address, opts) });
+      continue;
+    }
+  }
+
+  return attempts;
+}
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -58,7 +159,21 @@ async function tryRead(contract, fn, ...args) {
   try { return await contract[fn](...args); } catch { return null; }
 }
 
-async function getMintPrice(contract) {
+async function getMintPrice(contract, abi) {
+  // Try named price functions from real ABI first
+  if (Array.isArray(abi)) {
+    const priceFns = abi.filter(
+      (f) => f.type === "function" &&
+             (f.stateMutability === "view" || f.stateMutability === "pure") &&
+             (f.outputs || []).length === 1 &&
+             /price|cost|fee/i.test(f.name || "")
+    );
+    for (const fn of priceFns) {
+      const p = await tryRead(contract, fn.name);
+      if (p !== null && p >= 0n) return p;
+    }
+  }
+  // Fallback generic names
   for (const fn of ["price", "mintPrice", "cost", "getPrice"]) {
     const p = await tryRead(contract, fn);
     if (p !== null) return p;
@@ -73,100 +188,65 @@ async function getMaxSupply(contract) {
 
 function formatCountdown(ms) {
   if (ms <= 0) return "NOW";
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
+  const s   = Math.floor(ms / 1000);
+  const h   = Math.floor(s / 3600);
+  const m   = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (h > 0)  return `${h}h ${m}m ${sec}s`;
-  if (m > 0)  return `${m}m ${sec}s`;
+  if (h > 0) return `${h}h ${m}m ${sec}s`;
+  if (m > 0) return `${m}m ${sec}s`;
   return `${sec}s`;
 }
 
-// ─── MINT TIME RESOLUTION ─────────────────────────────────────────────────────
-// Priority: 1) OpenSea API (passed in from opensea.js)
-//           2) Manual .env override
-//           3) Contract on-chain time functions
-//           4) No time → mint immediately when eligible
+// ─── MINT TIME ────────────────────────────────────────────────────────────────
 
 async function resolveMintTime(collection, contract) {
-
-  // 1. OpenSea API — already fetched in opensea.js
   if (collection.mintStartTime) {
     const t = new Date(collection.mintStartTime);
-    log(`⏰ Mint time (from OpenSea API): ${t.toUTCString()}`);
+    log(`⏰ Mint time (OpenSea API): ${t.toUTCString()}`);
     if (collection.mintStage) log(`   Stage: ${collection.mintStage}`);
     return t;
   }
-
-  // 2. Manual .env override
   if (CONFIG.mintStartTime) {
     const t = new Date(CONFIG.mintStartTime);
     if (!isNaN(t.getTime())) {
-      log(`⏰ Mint time (from .env override): ${t.toUTCString()}`);
+      log(`⏰ Mint time (.env override): ${t.toUTCString()}`);
       return t;
     }
   }
-
-  // 3. Read time directly from contract
   for (const fn of ["mintStartTime", "startTime", "publicSaleStartTime", "saleStartTime"]) {
     const ts = await tryRead(contract, fn);
     if (ts !== null && ts > 0n) {
       const t = new Date(Number(ts) * 1000);
-      log(`⏰ Mint time (from contract ${fn}()): ${t.toUTCString()}`);
+      log(`⏰ Mint time (contract ${fn}()): ${t.toUTCString()}`);
       return t;
     }
   }
-
-  // 4. No scheduled time found
-  log(`⏰ No scheduled mint time detected — will mint as soon as eligible.`);
+  log(`⏰ No scheduled time found — minting as soon as eligible.`);
   return null;
 }
 
-// ─── COUNTDOWN ────────────────────────────────────────────────────────────────
-
 async function waitForMintTime(mintTime) {
   if (!mintTime) return;
-
-  const now    = Date.now();
   const target = mintTime.getTime();
+  if (Date.now() >= target) { log(`✅ Mint time already passed — proceeding.`); return; }
 
-  if (now >= target) {
-    log(`✅ Mint time already passed — proceeding immediately.`);
-    return;
-  }
-
-  const diff = target - now;
-  log(`\n⏳ Bot is armed. Mint opens in ${formatCountdown(diff)}`);
+  const diff = target - Date.now();
+  log(`\n⏳ Bot armed. Mint opens in ${formatCountdown(diff)}`);
   log(`   Target: ${mintTime.toUTCString()}`);
-  log(`   Bot will fire automatically — you can leave this running.\n`);
+  log(`   Leave this running — it will fire automatically.\n`);
 
   while (Date.now() < target) {
-    const remaining = target - Date.now();
-
-    if (remaining > 3_600_000) {
-      // > 1 hour: update every 60s
-      process.stdout.write(`\r⏳  ${formatCountdown(remaining)} until mint...   `);
-      await sleep(60_000);
-    } else if (remaining > 60_000) {
-      // 1 hour → 1 min: update every 10s
-      process.stdout.write(`\r⏳  ${formatCountdown(remaining)} until mint...   `);
-      await sleep(10_000);
-    } else if (remaining > 5_000) {
-      // Under 1 min: update every second
-      process.stdout.write(`\r🔥  MINTING IN ${formatCountdown(remaining)}...   `);
-      await sleep(1_000);
-    } else {
-      // Final 5 seconds
-      process.stdout.write(`\r🚨  FIRING IN ${Math.ceil(remaining / 1000)}s...   `);
-      await sleep(500);
-    }
+    const rem = target - Date.now();
+    if (rem > 3_600_000)      { process.stdout.write(`\r⏳  ${formatCountdown(rem)} until mint...   `); await sleep(60_000); }
+    else if (rem > 60_000)    { process.stdout.write(`\r⏳  ${formatCountdown(rem)} until mint...   `); await sleep(10_000); }
+    else if (rem > 5_000)     { process.stdout.write(`\r🔥  MINTING IN ${formatCountdown(rem)}...   `); await sleep(1_000); }
+    else                      { process.stdout.write(`\r🚨  FIRING IN ${Math.ceil(rem / 1000)}s...   `); await sleep(500); }
   }
-
   process.stdout.write("\n");
-  log(`🟢 Mint time reached! Executing...`);
+  log(`🟢 Mint time reached! Firing...`);
 }
 
-// ─── BALANCE CHECK ────────────────────────────────────────────────────────────
+// ─── BALANCE ──────────────────────────────────────────────────────────────────
 
 async function checkBalance(provider, address) {
   const balance    = await provider.getBalance(address);
@@ -181,7 +261,7 @@ async function checkBalance(provider, address) {
   return true;
 }
 
-// ─── ELIGIBILITY CHECK ────────────────────────────────────────────────────────
+// ─── ELIGIBILITY ──────────────────────────────────────────────────────────────
 
 async function checkEligibility(contract, walletAddress) {
   const paused = await tryRead(contract, "paused");
@@ -202,33 +282,29 @@ async function checkEligibility(contract, walletAddress) {
   const allowlistActive = await tryRead(contract, "allowlistMintEnabled");
   if (allowlistActive === true) {
     const whitelisted = await tryRead(contract, "isWhitelisted", walletAddress);
-    if (whitelisted === false) { log(`❌ Wallet not on allowlist.`); return false; }
-    log(`   Allowlist: ✅ eligible`);
+    if (whitelisted === false) { log(`❌ Not on allowlist.`); return false; }
+    log(`   Allowlist: ✅`);
   }
-
   return true;
 }
 
-// ─── GAS CHECK ────────────────────────────────────────────────────────────────
+// ─── GAS ──────────────────────────────────────────────────────────────────────
 
 async function gasPriceOk(provider) {
-  const feeData      = await provider.getFeeData();
-  const current      = feeData.gasPrice;
-  const maxGwei      = ethers.parseUnits(CONFIG.maxGasGwei, "gwei");
-  const currentGwei  = parseFloat(ethers.formatUnits(current, "gwei")).toFixed(3);
-  if (current > maxGwei) {
-    log(`⛽ Gas too high: ${currentGwei} Gwei (max: ${CONFIG.maxGasGwei})`);
-    return false;
-  }
+  const feeData     = await provider.getFeeData();
+  const current     = feeData.gasPrice;
+  const maxGwei     = ethers.parseUnits(CONFIG.maxGasGwei, "gwei");
+  const currentGwei = parseFloat(ethers.formatUnits(current, "gwei")).toFixed(3);
+  if (current > maxGwei) { log(`⛽ Gas too high: ${currentGwei} Gwei (max: ${CONFIG.maxGasGwei})`); return false; }
   log(`   Gas: ${currentGwei} Gwei ✅`);
   return true;
 }
 
 // ─── MINT ─────────────────────────────────────────────────────────────────────
 
-async function attemptMint(contract, wallet, provider) {
+async function attemptMint(contract, wallet, provider, abi) {
   const gasPrice     = (await provider.getFeeData()).gasPrice;
-  const pricePerUnit = await getMintPrice(contract);
+  const pricePerUnit = await getMintPrice(contract, abi);
   const totalValue   = pricePerUnit * BigInt(CONFIG.mintAmount);
 
   log(`   Mint price: ${ethers.formatEther(pricePerUnit)} ETH x ${CONFIG.mintAmount}`);
@@ -236,55 +312,77 @@ async function attemptMint(contract, wallet, provider) {
 
   const opts = { gasPrice, value: totalValue };
 
-  const attempts = [
-    () => contract["mint(uint256)"](CONFIG.mintAmount, opts),
-    () => contract["mint(address,uint256)"](wallet.address, CONFIG.mintAmount, opts),
-    () => contract.publicMint(CONFIG.mintAmount, opts),
-    () => contract.mintPublic(CONFIG.mintAmount, opts),
-    () => contract.mintNFT(CONFIG.mintAmount, opts),
-    () => contract.allowlistMint(CONFIG.mintAmount, opts),
-    () => contract.presaleMint(CONFIG.mintAmount, opts),
-    () => contract.safeMint(wallet.address, opts),
-  ];
+  // Build attempts from real ABI mint functions
+  const mintFns  = findMintFunctions(abi);
+  let attempts   = buildMintAttempts(mintFns, contract, wallet, opts);
 
-  for (const attempt of attempts) {
+  if (attempts.length === 0) {
+    log(`⚠️  No mint functions found in real ABI — using fallback signatures.`);
+    // Fallback hardcoded attempts
+    attempts = [
+      { label: "mint(uint256)",        call: () => contract["mint(uint256)"](CONFIG.mintAmount, opts) },
+      { label: "mint(address,uint256)",call: () => contract["mint(address,uint256)"](wallet.address, CONFIG.mintAmount, opts) },
+      { label: "claim()",              call: () => contract["claim()"](opts) },
+      { label: "claim(uint256)",       call: () => contract["claim(uint256)"](CONFIG.mintAmount, opts) },
+      { label: "publicMint(uint256)",  call: () => contract.publicMint(CONFIG.mintAmount, opts) },
+      { label: "mintTo(address,uint256)", call: () => contract.mintTo(wallet.address, CONFIG.mintAmount, opts) },
+      { label: "freeMint()",           call: () => contract.freeMint(opts) },
+      { label: "safeMint(address)",    call: () => contract.safeMint(wallet.address, opts) },
+    ];
+  } else {
+    log(`   Found ${attempts.length} mint function(s): ${attempts.map(a => a.label).join(", ")}`);
+  }
+
+  for (const { label, call } of attempts) {
     try {
-      log(`🚀 Sending mint transaction...`);
-      const tx      = await attempt();
+      log(`🚀 Trying ${label}...`);
+      const tx      = await call();
       log(`   Tx hash: ${tx.hash}`);
       const receipt = await tx.wait();
-      log(`✅ Minted! Block #${receipt.blockNumber} | Gas used: ${receipt.gasUsed}`);
+      log(`✅ Minted! Block #${receipt.blockNumber} | Gas: ${receipt.gasUsed}`);
       return receipt;
     } catch (err) {
       if (err.code === "INSUFFICIENT_FUNDS" || err.message?.includes("insufficient funds")) {
-        log(`💸 Insufficient funds for gas. Top up and restart.`, "ERROR");
+        log(`💸 Insufficient funds. Top up and restart.`, "ERROR");
         process.exit(1);
       }
       if (
         err.code === "CALL_EXCEPTION" ||
         err.message?.includes("is not a function") ||
         err.message?.includes("no matching function") ||
-        err.message?.includes("ambiguous function")
-      ) continue;
+        err.message?.includes("ambiguous function") ||
+        err.message?.includes("unknown function")
+      ) {
+        log(`   ↳ ${label} not compatible, trying next...`);
+        continue;
+      }
       throw err;
     }
   }
-  throw new Error("No compatible mint function found on this contract.");
+  throw new Error("No compatible mint function found. Check contract on block explorer.");
 }
 
-// ─── MAIN BOT LOOP ────────────────────────────────────────────────────────────
+// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 async function startMintBot(collection) {
   const { contractAddress, chain, rpcUrl, name } = collection;
 
   if (!process.env.PRIVATE_KEY) throw new Error("PRIVATE_KEY not set in .env");
-  if (!rpcUrl) throw new Error(`No RPC URL configured for chain: ${chain}`);
+  if (!rpcUrl) throw new Error(`No RPC URL for chain: ${chain}`);
 
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-  const contract = new ethers.Contract(contractAddress, ABI, wallet);
 
-  const balance = await provider.getBalance(wallet.address);
+  // Step 1 — Fetch real ABI from block explorer
+  log(`🔎 Fetching contract ABI from ${chain} explorer...`);
+  let abi = await fetchABIFromExplorer(contractAddress, chain);
+  if (!abi) {
+    log(`⚠️  Could not fetch ABI from explorer — using fallback ABI.`);
+    abi = FALLBACK_ABI;
+  }
+
+  const contract = new ethers.Contract(contractAddress, abi, wallet);
+  const balance  = await provider.getBalance(wallet.address);
 
   console.log("\n─────────────────────────────────────────");
   log(`Wallet:     ${wallet.address}`);
@@ -294,16 +392,19 @@ async function startMintBot(collection) {
   log(`Chain:      ${chain}`);
   log(`Mint amt:   ${CONFIG.mintAmount}`);
   log(`Max gas:    ${CONFIG.maxGasGwei} Gwei`);
+
+  // Show detected mint functions
+  const mintFns = findMintFunctions(abi);
+  if (mintFns.length > 0) {
+    log(`Mint fns:   ${mintFns.map(f => f.name + "()").join(", ")}`);
+  }
   console.log("─────────────────────────────────────────\n");
 
-  // Step 1 — Balance pre-check
-  const balanceOk = await checkBalance(provider, wallet.address);
-  if (!balanceOk) process.exit(1);
+  // Step 2 — Balance check
+  if (!(await checkBalance(provider, wallet.address))) process.exit(1);
 
-  // Step 2 — Resolve mint time (API → .env → contract → none)
+  // Step 3 — Resolve & wait for mint time
   const mintTime = await resolveMintTime(collection, contract);
-
-  // Step 3 — Wait with live countdown
   await waitForMintTime(mintTime);
 
   // Step 4 — Eligibility + mint loop
@@ -314,7 +415,6 @@ async function startMintBot(collection) {
     log(`Checking eligibility...`);
     try {
       const eligible = await checkEligibility(contract, wallet.address);
-
       if (!eligible) {
         log(`Not eligible yet. Retrying in ${CONFIG.checkIntervalMs / 1000}s...\n`);
         failures = 0;
@@ -323,14 +423,12 @@ async function startMintBot(collection) {
       }
 
       log(`🟢 ELIGIBLE! Checking gas...`);
-      const gasOk = await gasPriceOk(provider);
-      if (!gasOk) {
-        log(`Waiting ${CONFIG.retryDelayMs / 1000}s for gas to drop...`);
+      if (!(await gasPriceOk(provider))) {
         await sleep(CONFIG.retryDelayMs);
         continue;
       }
 
-      await attemptMint(contract, wallet, provider);
+      await attemptMint(contract, wallet, provider, abi);
       failures = 0;
       minted   = true;
 
@@ -339,18 +437,14 @@ async function startMintBot(collection) {
       log(`View on OpenSea: https://opensea.io/${wallet.address}`);
       console.log("══════════════════════════════════════\n");
 
-      if (CONFIG.mintOnce) { log("MINT_ONCE=true — bot stopping."); process.exit(0); }
+      if (CONFIG.mintOnce) { log("MINT_ONCE=true — stopping."); process.exit(0); }
 
     } catch (err) {
       failures++;
       log(`Error (${failures}/${CONFIG.maxRetries}): ${err.message}`, "ERROR");
-      if (failures >= CONFIG.maxRetries) {
-        log("Max retries reached. Stopping.", "ERROR");
-        process.exit(1);
-      }
+      if (failures >= CONFIG.maxRetries) { log("Max retries reached. Stopping.", "ERROR"); process.exit(1); }
       await sleep(CONFIG.retryDelayMs);
     }
-
     await sleep(CONFIG.checkIntervalMs);
   }
 }
