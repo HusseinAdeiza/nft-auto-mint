@@ -67,6 +67,24 @@ const FALLBACK_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 ];
 
+
+// SeaDrop contract address (OpenSea's minting contract — same on all EVM chains)
+const SEADROP_ADDRESS = '0x00005EA00Ac477B1030CE78506496e8C2dE24bf5';
+const SEADROP_ABI = [
+  'function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable',
+];
+
+async function trySeaDrop(nftAddress, wallet, provider, opts) {
+  const feeRecipient = '0x0000a26b00c1F0DF003000390027140000fAa719'; // OpenSea fee recipient
+  const seadrop = new (require("ethers").ethers.Contract)(SEADROP_ADDRESS, SEADROP_ABI, wallet);
+  log('🌊 SeaDrop contract detected — calling SeaDrop.mintPublic()...');
+  const tx = await seadrop.mintPublic(nftAddress, feeRecipient, wallet.address, opts.quantity || 1, { gasPrice: opts.gasPrice, value: opts.value });
+  log('   Tx hash: ' + tx.hash);
+  const receipt = await tx.wait();
+  log('✅ Minted via SeaDrop! Block #' + receipt.blockNumber + ' | Gas: ' + receipt.gasUsed);
+  return receipt;
+}
+
 // Keywords that identify a mint/claim write function
 const MINT_KEYWORDS = ["mint", "claim", "free", "drop", "collect", "redeem", "issue", "create"];
 
@@ -338,6 +356,12 @@ async function attemptMint(contract, wallet, provider, abi) {
     ];
   } else {
     log(`   Found ${attempts.length} mint function(s): ${attempts.map(a => a.label).join(", ")}`);
+  }
+
+  // Check if this is a SeaDrop contract — mintSeaDrop() means OpenSea controls minting
+  const isSeaDrop = Array.isArray(abi) && abi.some(f => f.name === 'mintSeaDrop');
+  if (isSeaDrop) {
+    return await trySeaDrop(contract.target, wallet, provider, { gasPrice, value: totalValue, quantity: CONFIG.mintAmount });
   }
 
   for (const { label, call } of attempts) {
