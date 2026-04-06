@@ -21,7 +21,7 @@ const CONFIG = {
 
 // Explorer API endpoints per chain
 const EXPLORER_API = {
-  ethereum:  { url: "https://api.etherscan.io/api",              key: process.env.ETHERSCAN_API_KEY  || "" },
+  ethereum:  { url: "https://api.etherscan.io/v2/api?chainid=1",  key: process.env.ETHERSCAN_API_KEY  || "" },
   arbitrum:  { url: "https://api.etherscan.io/v2/api?chainid=42161", key: process.env.ARBISCAN_API_KEY   || "" },
   base:      { url: "https://api.basescan.org/api",              key: process.env.BASESCAN_API_KEY   || "" },
   polygon:   { url: "https://api.polygonscan.com/api",           key: process.env.POLYGONSCAN_API_KEY|| "" },
