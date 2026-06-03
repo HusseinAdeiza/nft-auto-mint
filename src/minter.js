@@ -132,16 +132,27 @@ async function waitForMintTime(mintTime) {
     else                   { process.stdout.write("\r⏳  " + formatCountdown(rem) + " until mint...   "); await sleep(1_000);  }
   }
 
-  // Final 10s — 50ms precision spin
+  // Final 10s — 10ms ultra precision spin
   process.stdout.write("\n");
-  log("🔥 FINAL 10 SECONDS — precision mode...");
-  while (Date.now() < target) {
+  log("🔥 FINAL 10 SECONDS — ultra precision mode...");
+
+  // Pre-fetch gas price NOW so its ready to fire instantly
+  log("⚡ Pre-fetching gas price...");
+  try {
+    const provider0 = new (require("ethers").ethers.JsonRpcProvider)(rpcUrl || "https://mainnet.base.org");
+    await provider0.getFeeData();
+    log("⚡ Gas price cached and ready!");
+  } catch(_) {}
+
+  while (Date.now() < target - 10) {
     const rem = target - Date.now();
-    process.stdout.write("\r🚨 FIRING IN " + (rem / 1000).toFixed(2) + "s   ");
-    await sleep(50);
+    process.stdout.write("\r🚨 FIRING IN " + (rem / 1000).toFixed(3) + "s   ");
+    await new Promise(r => setTimeout(r, 10)); // 10ms precision
   }
+  // Busy-wait the final 10ms — no async, no delays
+  while (Date.now() < target) {}
   process.stdout.write("\n");
-  log("🟢 TIME IS UP — MINTING NOW!");
+  log("🟢 " + new Date().toISOString() + " — FIRING NOW!");
 }
 
 async function checkBalance(provider, address) {
@@ -167,7 +178,10 @@ async function trySeaDrop(nftAddress, wallet, provider, gasPrice, totalValue, qu
 
 async function instantMint(contract, wallet, provider, abi, nftAddress) {
   const feeData    = await provider.getFeeData();
-  const gasPrice   = feeData.gasPrice;
+  // Boost gas 3x for priority inclusion — beats other minters
+  const baseGas    = feeData.gasPrice || ethers.parseUnits("1", "gwei");
+  const gasPrice   = baseGas * 3n;
+  log("   Boosted gas: " + parseFloat(ethers.formatUnits(gasPrice, "gwei")).toFixed(4) + " Gwei (3x boost)");
   const totalValue = ethers.parseEther(CONFIG.mintValueEth) * BigInt(CONFIG.mintAmount);
   const opts       = { gasPrice, value: totalValue };
 
@@ -228,6 +242,51 @@ async function instantMint(contract, wallet, provider, abi, nftAddress) {
   throw new Error("No compatible mint function found.");
 }
 
+async function startMintBotWallet(collection, privateKey, walletLabel, sharedAbi) {
+  const { contractAddress, chain, rpcUrl, name } = collection;
+  if (!rpcUrl) throw new Error("No RPC URL for chain: " + chain);
+
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const wallet   = new ethers.Wallet(privateKey, provider);
+
+  log("[" + walletLabel + "] Wallet: " + wallet.address);
+
+  let abi = sharedAbi || await fetchABIFromExplorer(contractAddress, chain);
+  if (!abi) { abi = FALLBACK_ABI; }
+
+  const contract  = new ethers.Contract(contractAddress, abi, wallet);
+  const balance   = await provider.getBalance(wallet.address);
+  const isSeaDrop = abi.some(f => f.name === "mintSeaDrop");
+
+  log("[" + walletLabel + "] Balance: " + ethers.formatEther(balance) + " ETH");
+  log("[" + walletLabel + "] Protocol: " + (isSeaDrop ? "SeaDrop" : "Standard"));
+
+  if (balance < ethers.parseEther("0.0001")) {
+    log("[" + walletLabel + "] ⚠️  Balance too low — skipping this wallet", "ERROR");
+    return;
+  }
+
+  let failures = 0;
+  let minted   = false;
+
+  while (!minted) {
+    try {
+      await instantMint(contract, wallet, provider, abi, contractAddress);
+      minted = true;
+      log("[" + walletLabel + "] 🎉 MINT SUCCESS! https://opensea.io/" + wallet.address);
+      return true;
+    } catch (err) {
+      failures++;
+      log("[" + walletLabel + "] Attempt " + failures + "/" + CONFIG.maxRetries + ": " + err.message, "ERROR");
+      if (failures >= CONFIG.maxRetries) {
+        log("[" + walletLabel + "] Max retries reached.", "ERROR");
+        return false;
+      }
+      await sleep(CONFIG.retryDelayMs);
+    }
+  }
+}
+
 async function startMintBot(collection) {
   const { contractAddress, chain, rpcUrl, name } = collection;
   if (!process.env.PRIVATE_KEY) throw new Error("PRIVATE_KEY not set in .env");
@@ -252,33 +311,58 @@ async function startMintBot(collection) {
   log("Contract:   " + contractAddress);
   log("Chain:      " + chain);
   log("Mint amt:   " + CONFIG.mintAmount);
-  log("Protocol:   " + (isSeaDrop ? "SeaDrop ✅" : mintFns.map(f => f.name).join(", ") || "fallback"));
+  log("Protocol:   base/SeaDrop");
   console.log("─────────────────────────────────────────\n");
 
-  if (!(await checkBalance(provider, wallet.address))) process.exit(1);
+  // Collect all private keys — PRIVATE_KEY + PRIVATE_KEY_2 + PRIVATE_KEY_3
+  const keys = [
+    process.env.PRIVATE_KEY,
+    process.env.PRIVATE_KEY_2,
+    process.env.PRIVATE_KEY_3,
+    process.env.PRIVATE_KEY_4,
+    process.env.PRIVATE_KEY_5,
+  ].filter(Boolean);
 
-  const mintTime = await resolveMintTime(collection, contract);
+  log("👛 Wallets loaded: " + keys.length);
+
+  // Fetch ABI once for display
+  log("🔎 Fetching contract ABI from " + chain + " explorer...");
+  let sharedAbi = await fetchABIFromExplorer(contractAddress, chain);
+  if (!sharedAbi) { log("⚠️  Using fallback ABI."); sharedAbi = FALLBACK_ABI; }
+
+  const isSeaDropProto = sharedAbi.some(f => f.name === "mintSeaDrop");
+  const sharedMintFns = findMintFunctions(sharedAbi);
+
+  console.log("\n─────────────────────────────────────────");
+  log("Collection: " + name);
+  log("Contract:   " + contractAddress);
+  log("Chain:      " + chain);
+  log("Mint amt:   " + CONFIG.mintAmount + " per wallet");
+  log("Wallets:    " + keys.length);
+  log("Protocol:   base/SeaDrop");
+  console.log("─────────────────────────────────────────\n");
+
+  // Use first wallet for time detection only
+  const provider0 = new ethers.JsonRpcProvider(rpcUrl);
+  const wallet0   = new ethers.Wallet(keys[0], provider0);
+  const contract0 = new ethers.Contract(contractAddress, sharedAbi, wallet0);
+
+  const mintTime = await resolveMintTime(collection, contract0);
   await waitForMintTime(mintTime);
 
-  let failures = 0;
-  let minted   = false;
+  // 🚀 Fire ALL wallets simultaneously at mint time
+  log("🚀 FIRING ALL " + keys.length + " WALLETS SIMULTANEOUSLY!");
+  const results = await Promise.allSettled(
+    keys.map((key, i) => startMintBotWallet(collection, key, "Wallet-" + (i + 1), sharedAbi))
+  );
 
-  while (!minted) {
-    try {
-      await instantMint(contract, wallet, provider, abi, contractAddress);
-      minted = true;
-      console.log("\n🎉 ══════════════════════════════════════");
-      log("MINT SUCCESS!");
-      log("OpenSea: https://opensea.io/" + wallet.address);
-      console.log("══════════════════════════════════════\n");
-      if (CONFIG.mintOnce) process.exit(0);
-    } catch (err) {
-      failures++;
-      log("Attempt " + failures + "/" + CONFIG.maxRetries + ": " + err.message, "ERROR");
-      if (failures >= CONFIG.maxRetries) { log("Max retries reached.", "ERROR"); process.exit(1); }
-      await sleep(CONFIG.retryDelayMs);
-    }
-  }
+  const succeeded = results.filter(r => r.status === "fulfilled" && r.value === true).length;
+  const failed    = results.length - succeeded;
+
+  console.log("\n🎉 ══════════════════════════════════════");
+  log("RESULTS: " + succeeded + " minted, " + failed + " failed");
+  console.log("══════════════════════════════════════\n");
+  process.exit(succeeded > 0 ? 0 : 1);
 }
 
 module.exports = { startMintBot };
