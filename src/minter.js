@@ -25,7 +25,7 @@ const EXPLORER_API = {
   polygon:   { url: "https://api.etherscan.io/v2/api?chainid=137",   key: process.env.POLYGONSCAN_API_KEY || "" },
   optimism:  { url: "https://api.etherscan.io/v2/api?chainid=10",    key: process.env.OPTIMISM_API_KEY    || "" },
   avalanche: { url: "https://api.etherscan.io/v2/api?chainid=43114", key: process.env.SNOWTRACE_API_KEY   || "" },
-  robinhood: { url: "https://robinhoodchain.blockscout.com/api",          key: "" },
+  robinhood: { url: "https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=", key: "", custom: true },
 };
 
 const FALLBACK_ABI = [
@@ -72,7 +72,10 @@ async function fetchABIFromExplorer(contractAddress, chain) {
   const explorer = EXPLORER_API[chain];
   if (!explorer) return null;
   try {
-    const url = explorer.url + "&module=contract&action=getabi&address=" + contractAddress + "&apikey=" + explorer.key;
+    // Blockscout uses different URL format
+    const url = explorer.custom
+      ? explorer.url + contractAddress
+      : explorer.url + "&module=contract&action=getabi&address=" + contractAddress + "&apikey=" + explorer.key;
     const res  = await fetch(url);
     const data = await res.json();
     if (data.status !== "1" || !data.result) return null;
@@ -217,6 +220,16 @@ async function instantMint(contract, wallet, provider, abi, nftAddress) {
       { label: "claim()",               call: () => contract["claim()"](opts) },
       { label: "publicMint(uint256)",   call: () => contract.publicMint(CONFIG.mintAmount, opts) },
       { label: "freeMint()",            call: () => contract.freeMint(opts) },
+      { label: "mintSeaDrop(addr,qty)",  call: () => contract["mintSeaDrop(address,uint256)"](wallet.address, CONFIG.mintAmount, opts) },
+      { label: "mintPublic(addr,fee,minter,qty)", call: () => {
+        const feeRecipient = "0x0000a26b00c1F0DF003000390027140000fAa719";
+        const seadrop = new ethers.Contract("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5", ["function mintPublic(address,address,address,uint256) payable"], wallet);
+        return seadrop.mintPublic(contract.target, feeRecipient, wallet.address, CONFIG.mintAmount, opts);
+      }},
+      { label: "purchase(uint256)",      call: () => contract.purchase(CONFIG.mintAmount, opts) },
+      { label: "buy(uint256)",           call: () => contract.buy(CONFIG.mintAmount, opts) },
+      { label: "mintFor(address,uint256)", call: () => contract.mintFor(wallet.address, CONFIG.mintAmount, opts) },
+      { label: "batchMint(uint256)",     call: () => contract.batchMint(CONFIG.mintAmount, opts) },
     );
   }
 
