@@ -25,7 +25,7 @@ const EXPLORER_API = {
   polygon:   { url: "https://api.etherscan.io/v2/api?chainid=137",   key: process.env.POLYGONSCAN_API_KEY || "" },
   optimism:  { url: "https://api.etherscan.io/v2/api?chainid=10",    key: process.env.OPTIMISM_API_KEY    || "" },
   avalanche: { url: "https://api.etherscan.io/v2/api?chainid=43114", key: process.env.SNOWTRACE_API_KEY   || "" },
-  robinhood: { url: "https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=", key: "", custom: true },
+  robinhood: { url: "https://api.blockscout.com/api/v2/smart-contracts/", key: "", custom: true },
 };
 
 const FALLBACK_ABI = [
@@ -79,7 +79,6 @@ async function fetchABIFromExplorer(contractAddress, chain) {
     const res  = await fetch(url);
     const data = await res.json();
     if (data.status !== "1" || !data.result) return null;
-    const abi = JSON.parse(data.result);
     log("✅ Fetched real ABI from " + chain + " explorer (" + abi.length + " functions)");
     return abi;
   } catch { return null; }
