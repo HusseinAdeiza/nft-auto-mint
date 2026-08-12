@@ -25,6 +25,7 @@ const EXPLORER_API = {
   polygon:   { url: "https://api.etherscan.io/v2/api?chainid=137",   key: process.env.POLYGONSCAN_API_KEY || "" },
   optimism:  { url: "https://api.etherscan.io/v2/api?chainid=10",    key: process.env.OPTIMISM_API_KEY    || "" },
   avalanche: { url: "https://api.etherscan.io/v2/api?chainid=43114", key: process.env.SNOWTRACE_API_KEY   || "" },
+  robinhood: { url: "https://robinhoodchain.blockscout.com/api",          key: "" },
 };
 
 const FALLBACK_ABI = [
